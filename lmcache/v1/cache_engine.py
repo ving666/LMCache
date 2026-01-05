@@ -15,6 +15,7 @@ from typing import (
 import asyncio
 import gc
 import multiprocessing
+from pathlib import Path
 import time
 
 # Third Party
@@ -24,6 +25,7 @@ import torch
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
+from lmcache.persistent_store import DiskCacheMetadataStore
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
@@ -105,6 +107,7 @@ class LMCacheEngine:
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
         # save_only_first_rank only works when use mla
+        self.meta_store: Optional[DiskCacheMetadataStore] = None
         self.save_only_first_rank = (
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
             and metadata.use_mla
@@ -216,6 +219,14 @@ class LMCacheEngine:
     def post_init(self, **kwargs) -> None:
         if not self.post_inited:
             logger.info("Post initializing LMCacheEngine")
+
+            # Initialize the persistent metadata store if local_disk is enabled
+            if self.config.local_disk:
+                disk_cache_dir = Path(self.config.local_disk)
+                disk_cache_dir.mkdir(parents=True, exist_ok=True)
+                db_path = disk_cache_dir / "metadata.db"
+                self.meta_store = DiskCacheMetadataStore(db_path)
+
             lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
                 self.metadata.use_mla, self.metadata.world_size
             )
@@ -239,6 +250,8 @@ class LMCacheEngine:
                     event_manager=self.event_manager,
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
+                    # Pass the meta_store to the StorageManager
+                    meta_store=self.meta_store,
                 )
             self.post_inited = True
 
@@ -1351,6 +1364,8 @@ class LMCacheEngine:
             logger.info("Closing storage_manager...")
             if self.storage_manager is not None:
                 self.storage_manager.close()
+            if self.meta_store is not None:
+                self.meta_store.close()
             logger.info("storage_manager closed successfully")
         except Exception as e:
             logger.error(f"Error closing storage_manager: {e}")

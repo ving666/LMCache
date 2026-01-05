@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 import asyncio
 import os
+from pathlib import Path
 import threading
 import time
 
@@ -14,6 +15,7 @@ import torch
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
+from lmcache.persistent_store import DiskCacheMetadataStore
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
@@ -103,14 +105,24 @@ class LocalDiskBackend(StorageBackendInterface):
         dst_device: str = "cuda",
         lmcache_worker: Optional["LMCacheWorker"] = None,
         metadata: Optional[LMCacheEngineMetadata] = None,
+        meta_store: Optional[DiskCacheMetadataStore] = None,
     ):
         if torch.cuda.is_available():
             super().__init__(dst_device)
         else:
             super().__init__("cpu")
 
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+
         self.cache_policy = get_cache_policy(config.cache_policy)
-        self.dict = self.cache_policy.init_mutable_mapping()
+        self.meta_store = meta_store
+        if self.meta_store is not None:
+            # Load metadata from the persistent store
+            self.dict: Dict[CacheEngineKey, DiskCacheMetadata] = self.meta_store.load_all()
+            self._verify_disk_cache_files()
+        else:
+            # Fallback to in-memory mapping if no store is provided
+            self.dict = self.cache_policy.init_mutable_mapping()
 
         self.dst_device = dst_device
 
@@ -142,17 +154,15 @@ class LocalDiskBackend(StorageBackendInterface):
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
         self.max_cache_size = int(config.max_local_disk_size * 1024**3)
-        self.current_cache_size = 0.0
+        self.usage = sum(meta.size for meta in self.dict.values())
+        self.stats_monitor.update_local_storage_usage(self.usage)
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
         # (only one worker per cache engine)
         self.keys_in_request: List[CacheEngineKey] = []
 
-        self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
-        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-        self.usage = 0
 
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
@@ -170,6 +180,24 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def __str__(self):
         return "LocalDiskBackend"
+
+    def _verify_disk_cache_files(self):
+        """
+        Verify that the files pointed to by the metadata exist on disk.
+        Remove any stale metadata entries from both memory and the persistent store.
+        """
+        stale_keys = []
+        for key, meta in list(self.dict.items()):
+            if not Path(meta.path).exists():
+                logger.warning(
+                    f"Metadata points to a non-existent file {meta.path}. "
+                    f"Removing stale entry for key {key.to_string()}."
+                )
+                stale_keys.append(key)
+
+        if stale_keys:
+            with self.disk_lock:
+                self.batched_remove(stale_keys, force=False)
 
     def _key_to_path(
         self,
@@ -224,40 +252,74 @@ class LocalDiskBackend(StorageBackendInterface):
         key: CacheEngineKey,
         force: bool = True,
     ) -> bool:
-        if force:
-            self.disk_lock.acquire()
+        """
+        Safely removes a key from the disk backend. This method is thread-safe.
+        """
 
-        if not (meta := self.dict.pop(key, None)):
+        def _perform_remove():
+            if not (meta := self.dict.pop(key, None)):
+                return False
+
+            path = meta.path
+            size = meta.size
+            self.usage -= size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+
+            if self.meta_store:
+                self.meta_store.delete_by_str(key.to_string())
+
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                logger.warning(
+                    f"File {path} not found during removal, but metadata was cleaned up."
+                )
+            except Exception as e:
+                logger.error(f"Error removing file {path}: {e}")
+
             if force:
-                self.disk_lock.release()
-            return False
+                self.cache_policy.update_on_force_evict(key)
 
-        path = meta.path
-        size = meta.size
-        self.usage -= size
-        self.stats_monitor.update_local_storage_usage(self.usage)
+            if self.batched_msg_sender is not None:
+                self.batched_msg_sender.add_kv_op(
+                    op_type=OpType.EVICT,
+                    key=key.chunk_hash,
+                )
+            return True
 
-        # NOTE: The following code will cause deadlock
-        # res = asyncio.run_coroutine_threadsafe(
-        #     self.disk_worker.submit_task("delete", os.remove, path),
-        #     self.loop,
-        # )
-        # res.result()
-
-        os.remove(path)
-
+        # Use a 'with' statement to ensure the lock is always released
         if force:
-            self.cache_policy.update_on_force_evict(key)
-            self.disk_lock.release()
+            with self.disk_lock:
+                return _perform_remove()
+        else:
+            # Assumes the caller already holds the lock
+            return _perform_remove()
 
-        # Push kv evict msg with batching
-        if self.batched_msg_sender is not None:
-            self.batched_msg_sender.add_kv_op(
-                op_type=OpType.EVICT,
-                key=key.chunk_hash,
-            )
+    def batched_remove(self, keys: List[CacheEngineKey], force: bool = True) -> int:
+        keys_to_delete_from_db = []
+        paths_to_delete_from_disk = []
 
-        return True
+        with self.disk_lock:
+            for key in keys:
+                if meta := self.dict.pop(key, None):
+                    self.usage -= meta.size
+                    paths_to_delete_from_disk.append(meta.path)
+                    if self.meta_store:
+                        keys_to_delete_from_db.append(key.to_string())
+                    if self.batched_msg_sender is not None:
+                        self.batched_msg_sender.add_kv_op(
+                            op_type=OpType.EVICT, key=key.chunk_hash
+                        )
+            self.stats_monitor.update_local_storage_usage(self.usage)
+            if self.meta_store and keys_to_delete_from_db:
+                self.meta_store.batched_delete_by_str(keys_to_delete_from_db)
+
+        for path in paths_to_delete_from_disk:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                logger.warning(f"File {path} not found during batched removal.")
+        return len(paths_to_delete_from_disk)
 
     def insert_key(
         self,
@@ -277,9 +339,13 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.cache_policy.update_on_hit(key, self.dict)
                 has_stored = True
             else:
-                self.dict[key] = DiskCacheMetadata(
+                metadata = DiskCacheMetadata(
                     path, size, shape, dtype, cached_positions, fmt, 0
                 )
+                self.dict[key] = metadata
+                # Persist the new metadata
+                if self.meta_store:
+                    self.meta_store.save(key, metadata)
 
         # Push kv admit msg with batching
         if self.batched_msg_sender is not None and not has_stored:
@@ -307,7 +373,7 @@ class LocalDiskBackend(StorageBackendInterface):
         all_evict_keys = []
         evict_success = True
         with self.disk_lock:
-            while self.current_cache_size + required_size > self.max_cache_size:
+            while self.usage + required_size > self.max_cache_size:
                 evict_keys = self.cache_policy.get_evict_candidates(
                     self.dict, num_candidates=1
                 )
@@ -318,22 +384,22 @@ class LocalDiskBackend(StorageBackendInterface):
                     evict_success = False
                     break
 
-                for evict_key in evict_keys:
-                    self.current_cache_size -= self.dict[evict_key].size
-
                 self.batched_remove(evict_keys, force=False)
 
                 all_evict_keys.extend(evict_keys)
             if evict_success:
-                self.current_cache_size += required_size
+                self.usage += required_size
+                self.stats_monitor.update_local_storage_usage(self.usage)
 
         if not evict_success:
+            # If we failed to make space, remove the task to prevent it from being stuck
+            self.disk_worker.remove_put_task(key)
             return None
 
         self.cache_policy.update_on_put(key)
         memory_obj.ref_count_up()
 
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             self.disk_worker.submit_task(
                 "put",
                 self.async_save_bytes_to_disk,
@@ -342,6 +408,18 @@ class LocalDiskBackend(StorageBackendInterface):
             ),
             self.loop,
         )
+
+        # Add a callback to handle failures in the async task, ensuring usage is corrected
+        def _handle_put_failure(fut: Future):
+            if fut.exception():
+                logger.error(f"Async put task for key {key} failed: {fut.exception()}")
+                with self.disk_lock:
+                    self.usage -= required_size
+                    self.stats_monitor.update_local_storage_usage(self.usage)
+                # Also remove the task from the worker queue on failure
+                self.disk_worker.remove_put_task(key)
+
+        future.add_done_callback(_handle_put_failure)
 
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
@@ -466,10 +544,6 @@ class LocalDiskBackend(StorageBackendInterface):
         assert kv_chunk is not None
         buffer = memory_obj.byte_array
         path = self._key_to_path(key)
-
-        size = len(buffer)
-        self.usage += size
-        self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
         self.write_file(buffer, path)

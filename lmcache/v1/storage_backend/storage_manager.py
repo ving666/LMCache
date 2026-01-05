@@ -25,6 +25,7 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
+from lmcache.persistent_store import DiskCacheMetadataStore
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
     CacheEngineKey,
@@ -214,6 +215,7 @@ class StorageManager:
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
+        meta_store: Optional["DiskCacheMetadataStore"] = None,
     ):
         self.config = config
         self.metadata = metadata
@@ -238,6 +240,7 @@ class StorageManager:
                 self.loop,
                 dst_device,
                 lmcache_worker,
+                meta_store=meta_store,
             )
         )
 

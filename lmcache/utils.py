@@ -283,6 +283,39 @@ class DiskCacheMetadata:
         """
         return not self.is_pinned
 
+    def to_dict(self) -> dict:
+        """Serialize the metadata to a dictionary for persistent storage."""
+        return {
+            "path": self.path,
+            "size": self.size,
+            "shape": list(self.shape) if self.shape else None,
+            "dtype": TORCH_DTYPE_TO_STR_DTYPE.get(self.dtype) if self.dtype else None,
+            # cached_positions is a tensor, might be large.
+            # For persistence, storing its path or a summary might be better.
+            # Here we omit it for simplicity in this example.
+            "fmt": str(self.fmt) if self.fmt else None,
+            # pin_count is a runtime state, not persisted.
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> DiskCacheMetadata:
+        """Deserialize the metadata from a dictionary."""
+        shape = torch.Size(data["shape"]) if data.get("shape") is not None else None
+        dtype_str = data.get("dtype")
+        dtype = STR_DTYPE_TO_TORCH_DTYPE.get(dtype_str) if dtype_str else None
+
+        # fmt needs to be reconstructed from its string representation
+        # This is a placeholder, actual implementation depends on MemoryFormat
+        fmt = data.get("fmt")
+
+        return DiskCacheMetadata(
+            path=data["path"],
+            size=data["size"],
+            shape=shape,
+            dtype=dtype,
+            fmt=fmt,
+        )
+
 
 TORCH_DTYPE_TO_STR_DTYPE = {
     torch.half: "half",

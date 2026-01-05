@@ -10,6 +10,7 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
+from lmcache.persistent_store import DiskCacheMetadataStore
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
@@ -109,6 +110,7 @@ def CreateStorageBackends(
     loop: asyncio.AbstractEventLoop,
     dst_device: str = "cuda",
     lmcache_worker: Optional["LMCacheWorker"] = None,
+    meta_store: Optional[DiskCacheMetadataStore] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     if is_cuda_worker(metadata):
         dst_device = f"cuda:{torch.cuda.current_device()}"
@@ -175,7 +177,13 @@ def CreateStorageBackends(
     if config.local_disk and config.max_local_disk_size > 0:
         assert local_cpu_backend is not None
         local_disk_backend = LocalDiskBackend(
-            config, loop, local_cpu_backend, dst_device, lmcache_worker, metadata
+            config,
+            loop,
+            local_cpu_backend,
+            dst_device,
+            lmcache_worker,
+            metadata,
+            meta_store=meta_store,
         )
 
         backend_name = str(local_disk_backend)
