@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, List, Optional
 import uuid
 
 # Third Party
 from sglang.srt.configs.model_config import ModelConfig
 import torch
+import torch.distributed as dist
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
@@ -25,7 +26,7 @@ logger = init_logger(__name__)
 
 
 def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
-    if lmcache_config.enable_nixl:
+    if lmcache_config.enable_pd:
         return False
     else:
         return True
@@ -49,11 +50,19 @@ class LoadMetadata:
 def init_lmcache_engine(
     model_config: ModelConfig,
     tp_size: int,
-    rank: int,
+    local_rank: int,
+    global_rank: int,
     kv_dtype: torch.dtype,
 ) -> LMCacheEngine:
     """
-    TODO: ADD COMMENTS
+    Initialize LMCache engine for SGLang integration.
+
+    Args:
+        model_config: SGLang model configuration
+        tp_size: Tensor parallel size
+        local_rank: Local GPU device index (for device selection)
+        global_rank: Global tensor parallel rank (for metadata)
+        kv_dtype: Data type for KV cache tensors
     """
     if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
         return curr_engine
@@ -71,13 +80,14 @@ def init_lmcache_engine(
 
     kv_shape = (num_layer, 2, chunk_size, num_kv_head, head_dim)
 
-    # Change current device.
-    torch.cuda.device(rank)
-    device = torch.device(f"cuda:{rank}")
+    # Change current device using local GPU index
+    torch.cuda.device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    # Use global rank for metadata (tensor parallel rank)
     metadata = LMCacheEngineMetadata(
         model_config.model_path,
         tp_size,
-        rank,
+        global_rank,
         "sgl",
         kv_dtype,
         kv_shape,
@@ -128,18 +138,31 @@ class LMCacheConnector:
         k_pool: List[torch.Tensor],
         v_pool: List[torch.Tensor],
     ):
+        if not k_pool:
+            raise ValueError("k_pool cannot be empty during initialization.")
         kv_dtype = k_pool[0].dtype
+        if k_pool[0].is_cuda and k_pool[0].device.index is not None:
+            local_rank = k_pool[0].device.index
+        else:
+            # Fallback for CPU / odd cases
+            local_rank = rank
+
+        # rank is the global tensor parallel rank (tp_rank) from SGLang
+        # local_rank is the local GPU device index
         self.lmcache_engine = init_lmcache_engine(
             sgl_config,
             tp_size,
-            rank,
+            local_rank,
+            rank,  # global_rank (tp_rank) for metadata
             kv_dtype,
         )
         self.sgl_config = sgl_config
         self.tp_size = tp_size
-        self.rank = rank
+        self.rank = local_rank  # Use local_rank for torch.device() calls
         self.kvcaches = k_pool + v_pool
         self.num_layer = sgl_config.num_hidden_layers
+
+        self.lmcache_engine.post_init(kvcaches=self.kvcaches)
 
     ####################
     # Worker side APIs
@@ -208,12 +231,27 @@ class LMCacheLayerwiseConnector(LMCacheConnector):
         rank: int,
         k_pool: List[torch.Tensor],
         v_pool: List[torch.Tensor],
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(sgl_config, tp_size, rank, k_pool, v_pool)
         self._lmcache_chunk_size = self.lmcache_engine.config.chunk_size
         self.layerwise_retrievers: List[Any] = []
         self.layer_load_layer: List[int] = []
         self.kvcaches = [k_pool, v_pool]
+        self.tp_group = tp_group
+        self.lookup_id_list: List[str] = []
+
+    @torch.no_grad()
+    def global_min_tokens(
+        self, local_tokens: int, tp_group: dist.ProcessGroup, device: torch.device
+    ):
+        # If tensor parallel size is 1, no need for all_reduce
+        if self.tp_size == 1:
+            return local_tokens
+
+        t = torch.tensor([local_tokens], dtype=torch.int32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=tp_group)
+        return int(t.item())
 
     def load_kv_layerwise(self, layer_id: int) -> None:
         if len(self.layerwise_retrievers) == 0:
@@ -230,6 +268,8 @@ class LMCacheLayerwiseConnector(LMCacheConnector):
         for i in sorted(indices_to_remove, reverse=True):
             del self.layerwise_retrievers[i]
             del self.layer_load_layer[i]
+            self.lmcache_engine.lookup_unpin(self.lookup_id_list[i])
+            del self.lookup_id_list[i]
 
         return
 
@@ -243,26 +283,38 @@ class LMCacheLayerwiseConnector(LMCacheConnector):
         load_mask = torch.ones_like(token_ids, dtype=torch.bool)
         load_mask[:offset] = False
 
-        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+        lookup_id = str(uuid.uuid4())
+        retrieve_token_num = self.lmcache_engine.lookup(
             token_ids,
-            mask=load_mask,
+            lookup_id=lookup_id,
+            pin=True,
+        )
+
+        retrieve_token_num = self.global_min_tokens(
+            retrieve_token_num, self.tp_group, torch.device(f"cuda:{self.rank}")
+        )
+
+        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+            token_ids[:retrieve_token_num],
+            mask=load_mask[:retrieve_token_num],
             kvcaches=self.kvcaches,
-            slot_mapping=slot_mapping,
+            slot_mapping=slot_mapping[:retrieve_token_num],
             sync=False,
         )
 
-        retrieve_token_num = next(layerwise_retriever)
+        next(layerwise_retriever)
         # Load First Layer
         next(layerwise_retriever)
 
         if retrieve_token_num is None:
             return 0
 
-        retrieve_token_num = retrieve_token_num.item()
         self.layerwise_retrievers.append(layerwise_retriever)
         self.layer_load_layer.append(1)
 
-        return retrieve_token_num
+        self.lookup_id_list.append(lookup_id)
+
+        return retrieve_token_num - offset
 
     def store_kv(self, store_metadata: StoreMetadata) -> None:
         slot_mapping = store_metadata.kv_indices.to(torch.int64).cuda()
@@ -284,4 +336,4 @@ class LMCacheLayerwiseConnector(LMCacheConnector):
         for _ in range(self.sgl_config.num_hidden_layers):
             next(layerwise_storer)
 
-        self.lmcache_engine.lookup_unpin([lookup_id])
+        self.lmcache_engine.lookup_unpin(lookup_id)

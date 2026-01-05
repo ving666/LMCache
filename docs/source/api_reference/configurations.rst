@@ -57,7 +57,7 @@ Basic cache settings that control the core functionality of LMCache.
      - Hash algorithm for prefix-caching. Default: "builtin"
    * - save_unfull_chunk
      - LMCACHE_SAVE_UNFULL_CHUNK
-     - Whether to save unfull chunks. Values: true/false. Default: true
+     - Whether to save unfull chunks. Values: true/false. Default: false
    * - blocking_timeout_secs
      - LMCACHE_BLOCKING_TIMEOUT_SECS
      - Timeout for blocking operations in seconds. Default: 10
@@ -79,6 +79,47 @@ Basic cache settings that control the core functionality of LMCache.
    * - extra_config
      - LMCACHE_EXTRA_CONFIG={"key": value, ...}
      - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. Default: {}
+
+Lazy Memory Allocator Configurations
+------------------------------------
+
+Settings for the lazy memory allocator that enables gradual memory allocation to reduce startup time and initial memory footprint.
+
+.. note::
+
+    The lazy memory allocator is designed for scenarios with large CPU memory configurations. It starts with a small initial allocation and gradually expands as needed, reducing startup wait time and avoiding unnecessary memory consumption when the full capacity is not required.
+    
+    **Key characteristics:**
+    
+    - **One-time expansion**: Memory expands until target size is reached, then stops
+    - **No shrinking**: Once allocated, memory is never released back to the system
+    - **Automatic activation**: Only activates when ``max_local_cpu_size`` exceeds ``lazy_memory_safe_size``
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - YAML Config Name
+     - Environment Variable
+     - Description
+   * - enable_lazy_memory_allocator
+     - LMCACHE_ENABLE_LAZY_MEMORY_ALLOCATOR
+     - Whether to enable lazy memory allocator. Values: true/false. Default: false
+   * - lazy_memory_initial_ratio
+     - LMCACHE_LAZY_MEMORY_INITIAL_RATIO
+     - Initial memory allocation ratio (0.0-1.0). Determines the fraction of max_local_cpu_size to allocate at startup. Default: 0.2 (20%)
+   * - lazy_memory_expand_trigger_ratio
+     - LMCACHE_LAZY_MEMORY_EXPAND_TRIGGER_RATIO
+     - Memory usage ratio (0.0-1.0) that triggers expansion. When used memory exceeds this ratio of current capacity, expansion begins. Default: 0.5 (50%)
+   * - lazy_memory_step_ratio
+     - LMCACHE_LAZY_MEMORY_STEP_RATIO
+     - Memory expansion step ratio (0.0-1.0). Each expansion adds this fraction of max_local_cpu_size. Default: 0.1 (10%)
+   * - lazy_memory_safe_size
+     - LMCACHE_LAZY_MEMORY_SAFE_SIZE
+     - Threshold in GB above which lazy allocator activates. If max_local_cpu_size ≤ this value, lazy allocator is disabled regardless of enable_lazy_memory_allocator setting. Default: 0.0
+   * - reserve_local_cpu_size
+     - LMCACHE_RESERVE_LOCAL_CPU_SIZE
+     - Reserved system memory in GB that should not be allocated by LMCache. Used to prevent out-of-memory conditions. Default: 0.0
      
 Cache Blending Configurations
 -----------------------------
@@ -87,7 +128,8 @@ Settings related to cache blending functionality.
 
 .. note::
 
-    Cache blending is not supported in the latest version. We are working on it and will add it back soon.
+    We have an end-to-end `example <https://github.com/LMCache/LMCache/tree/dev/examples/blend_kv_v1>`_.
+    We also have more :doc:`detailed documentation <../kv_cache_optimizations/blending>`.
 
 .. list-table::
    :header-rows: 1
@@ -99,12 +141,12 @@ Settings related to cache blending functionality.
    * - enable_blending
      - LMCACHE_ENABLE_BLENDING
      - Whether to enable blending. Values: true/false. Default: false
-   * - blend_recompute_ratio
-     - LMCACHE_BLEND_RECOMPUTE_RATIO
+   * - blend_recompute_ratios
+     - LMCACHE_BLEND_RECOMPUTE_RATIOS
      - Ratio of blending recompute. Default: 0.15
-   * - blend_min_tokens
-     - LMCACHE_BLEND_MIN_TOKENS
-     - Minimum number of tokens for blending. Default: 256
+   * - blend_check_layers
+     - LMCACHE_BLEND_CHECK_LAYERS
+     - Layers to determine the recomputed tokens. Default: 1
    * - blend_special_str
      - LMCACHE_BLEND_SPECIAL_STR
      - Separator string for blending. Default: " # # "
@@ -124,12 +166,18 @@ Settings for enabling and configuring peer-to-peer CPU KV cache sharing and glob
    * - enable_p2p
      - LMCACHE_ENABLE_P2P
      - Whether to enable peer-to-peer sharing. Values: true/false. Default: false
-   * - lookup_url
-     - LMCACHE_LOOKUP_URL
-     - URL of the lookup server. Required if enable_p2p is true
-   * - distributed_url
-     - LMCACHE_DISTRIBUTED_URL
-     - URL of the distributed server. Required if enable_p2p is true
+   * - p2p_host
+     - LMCACHE_P2P_HOST
+     - Ip address. Required if enable_p2p is true
+   * - peer_init_ports
+     - LMCACHE_PEER_INIT_PORTS
+     - Ports for p2p peer init. Required if enable_p2p is true
+   * - peer_lookup_ports
+     - LMCACHE_PEER_lookup_PORTS
+     - Ports for p2p peer lookup. Required if enable_p2p is true
+   * - transfer_channel
+     - LMCACHE_TRANSFER_CHANNEL
+     - Such as `nixl`. Required if enable_p2p is true
 
 Controller Configurations
 -------------------------
@@ -156,14 +204,14 @@ Settings for the KV cache controller functionality.
      - LMCACHE_LMCACHE_WORKER_PORT
      - Port number for LMCache worker
 
-Nixl (Disaggregated Prefill) Configurations
+Disaggregated Prefill Configurations
 -------------------------------------------
 
-Settings for Nixl-based disaggregated prefill functionality. The latest/default nixl backend/connector are implemented inside of `lmcache/v1/storage_backend/nixl_backend_v3` and `lmcache/v1/storage_backend/connector/nixl_connector_v3.py`.
+Settings for disaggregated prefill functionality. The latest/default PD is implemented inside of `lmcache/v1/storage_backend/pd_backend.py`.
 
 .. note::
 
-    When Nixl is enabled, the following restrictions apply (welcome contributions to remove these restrictions):
+    When PD is enabled, the following restrictions apply (welcome contributions to remove these restrictions):
     
     - remote_url must be null
     - save_decode_cache must be false
@@ -176,42 +224,64 @@ Settings for Nixl-based disaggregated prefill functionality. The latest/default 
    * - YAML Config Name
      - Environment Variable
      - Description
-   * - enable_nixl
-     - LMCACHE_ENABLE_NIXL
-     - Whether to enable Nixl. Values: true/false. Default: false
-   * - enable_xpyd
-     - LMCACHE_ENABLE_XPYD
-     - Should be true when enable_nixl=true to use latest v3 nixl backend/connector. Values: true/false. Default: false
-   * - nixl_role
-     - LMCACHE_NIXL_ROLE
-     - Nixl role. Values: "sender" (prefiller) or "receiver" (decoder). Required when enable_nixl=true
-   * - nixl_buffer_size
-     - LMCACHE_NIXL_BUFFER_SIZE
-     - Transport buffer size for Nixl in bytes. Required for both senders and receivers when enable_nixl=true
-   * - nixl_buffer_device
-     - LMCACHE_NIXL_BUFFER_DEVICE
-     - Device for Nixl buffer. Values: "cpu", "cuda". Required for both senders and receivers when enable_nixl=true
+   * - enable_pd
+     - LMCACHE_ENABLE_PD
+     - Whether to enable PD. Values: true/false. Default: false
+   * - transfer_channel
+     - LMCACHE_TRANSFER_CHANNEL
+     - Transfer channel used for PD. Values: "nixl". Default: none
+   * - pd_role
+     - LMCACHE_PD_ROLE
+     - PD role. Values: "sender" (prefiller) or "receiver" (decoder).
+   * - pd_buffer_size
+     - LMCACHE_PD_BUFFER_SIZE
+     - Transport buffer size for PD in bytes. Required for both senders and receivers when enable_pd=true
+   * - pd_buffer_device
+     - LMCACHE_PD_BUFFER_DEVICE
+     - Device for PD buffer. Values: "cpu", "cuda". Required for both senders and receivers when enable_pd=true
    * - nixl_backends
      - LMCACHE_NIXL_BACKENDS
      - List of Nixl transport backends. Useful for non-disaggregated use case (see below). UCX default is sufficient for disagg use case. Default: ["UCX"]
-   * - nixl_enable_gc
-     - LMCACHE_NIXL_ENABLE_GC
-     - Whether to enable Nixl garbage collection. Values: true/false. Default: false
-   * - nixl_peer_host
-     - LMCACHE_NIXL_PEER_HOST
+   * - pd_peer_host
+     - LMCACHE_PD_PEER_HOST
      - Host for peer connections. Required for receivers to bind to
-   * - nixl_peer_init_port
-     - LMCACHE_NIXL_PEER_INIT_PORT
+   * - pd_peer_init_port
+     - LMCACHE_PD_PEER_INIT_PORT
      - Initialization port for peer connections. Required for receivers to bind to
-   * - nixl_peer_alloc_port
-     - LMCACHE_NIXL_PEER_ALLOC_PORT
+   * - pd_peer_alloc_port
+     - LMCACHE_PD_PEER_ALLOC_PORT
      - Allocation port for peer connections. Required for receivers to bind to
-   * - nixl_proxy_host
-     - LMCACHE_NIXL_PROXY_HOST
+   * - pd_proxy_host
+     - LMCACHE_PD_PROXY_HOST
      - Host for proxy server. Required for senders to connect to inform the proxy when transfer to decoder has been completed
-   * - nixl_proxy_port
-     - LMCACHE_NIXL_PROXY_PORT
+   * - pd_proxy_port
+     - LMCACHE_PD_PROXY_PORT
      - Port for proxy server. Required for senders to connect to inform the proxy when transfer to decoder has been completed
+
+P2P Backend Configurations
+--------------------------
+
+Settings for P2P (peer-to-peer) backend timeout behavior. These configurations are specified through ``extra_config``.
+
+.. code-block:: yaml
+
+    extra_config:
+      p2p_socket_recv_timeout_ms: 30000
+      p2p_socket_send_timeout_ms: 10000
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Configuration Key
+     - Default
+     - Description
+   * - p2p_socket_recv_timeout_ms
+     - 30000
+     - Timeout in milliseconds for socket receive operations
+   * - p2p_socket_send_timeout_ms
+     - 10000
+     - Timeout in milliseconds for socket send operations
 
 Nixl (as a storage backend) Configurations
 ------------------------------------------
@@ -226,8 +296,7 @@ Settings for using Nixl as a storage backend instead of disaggregated prefill. T
 
   
     extra_config: 
-      # enable_nixl_storage will disable disaggregated prefill mode, even if
-      # enable_nixl is true.
+      # enable_nixl_storage will disable disaggregated prefill mode.
       enable_nixl_storage: true
       nixl_backend: "POSIX"  # Options: "GDS", "GDS_MT", "POSIX", "HF3FS"
       nixl_path: "/path/to/storage/"
@@ -261,9 +330,6 @@ Settings for different storage backends and paths.
    * - YAML Config Name
      - Environment Variable
      - Description
-   * - weka_path
-     - LMCACHE_WEKA_PATH
-     - Path for Weka storage backend
    * - gds_path
      - LMCACHE_GDS_PATH
      - Path for GDS backend

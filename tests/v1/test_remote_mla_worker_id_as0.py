@@ -64,7 +64,7 @@ def test_remote_mla_worker_id_as0(mock_stream):
         model_name="test-model",
         fmt="vllm",
         kv_dtype=torch.float16,
-        kv_shape=(2, 32, 1000, 1024, 1),
+        kv_shape=(32, 1, 256, 64, 128),
         use_mla=True,
         world_size=4,
         worker_id=2,
@@ -73,7 +73,7 @@ def test_remote_mla_worker_id_as0(mock_stream):
         model_name="test-model",
         fmt="vllm",
         kv_dtype=torch.float16,
-        kv_shape=(1, 32, 1, 1024, 1),
+        kv_shape=(32, 1, 256, 64, 128),
         use_mla=True,
         world_size=4,
         worker_id=0,
@@ -84,7 +84,9 @@ def test_remote_mla_worker_id_as0(mock_stream):
     from lmcache.v1.memory_management import AdHocMemoryAllocator
 
     pin_allocator = AdHocMemoryAllocator()
-    local_cpu_backend = LocalCPUBackend(config, memory_allocator=pin_allocator)
+    local_cpu_backend = LocalCPUBackend(
+        config, metadata, memory_allocator=pin_allocator
+    )
 
     loop = asyncio.new_event_loop()
     backend = RemoteBackend(
@@ -92,7 +94,6 @@ def test_remote_mla_worker_id_as0(mock_stream):
         metadata=metadata,
         loop=loop,
         local_cpu_backend=local_cpu_backend,
-        lookup_server=None,
     )
     backend.connection = MockConnector()
 
@@ -107,14 +108,17 @@ def test_remote_mla_worker_id_as0(mock_stream):
         world_size=4,
         worker_id=2,
         chunk_hash="test_hash",
+        dtype=torch.float32,
     )
 
+    local_cpu_backend0 = LocalCPUBackend(
+        config, metadata0, memory_allocator=pin_allocator
+    )
     backend0 = RemoteBackend(
         config=config,
         metadata=metadata0,
         loop=loop,
-        local_cpu_backend=local_cpu_backend,
-        lookup_server=None,
+        local_cpu_backend=local_cpu_backend0,
     )
     backend0.connection = backend.connection
     # Create key
@@ -124,6 +128,7 @@ def test_remote_mla_worker_id_as0(mock_stream):
         world_size=4,
         worker_id=0,
         chunk_hash="test_hash",
+        dtype=torch.float32,
     )
 
     # Test not contains before adding data

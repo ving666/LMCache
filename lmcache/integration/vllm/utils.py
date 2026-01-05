@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple
 import os
+import threading
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -12,14 +13,15 @@ if TYPE_CHECKING:
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineConfig as Config  # type: ignore[assignment]
 from lmcache.logging import init_logger
-from lmcache.v1.config import (
-    LMCacheEngineConfig as V1Config,  # type: ignore[assignment]
-)
+from lmcache.v1.config import LMCacheEngineConfig
 
 logger = init_logger(__name__)
 ENGINE_NAME = "vllm-instance"
+
+# Thread-safe singleton storage
+_config_instance: Optional[LMCacheEngineConfig] = None
+_config_lock = threading.Lock()
 
 
 def is_false(value: str) -> bool:
@@ -27,40 +29,37 @@ def is_false(value: str) -> bool:
     return value.lower() in ("false", "0", "no", "n", "off")
 
 
-def lmcache_get_config() -> Union[Config, V1Config]:
+def lmcache_get_or_create_config() -> LMCacheEngineConfig:
     """Get the LMCache configuration from the environment variable
     `LMCACHE_CONFIG_FILE`. If the environment variable is not set, this
     function will return the default configuration.
+
+    This function is thread-safe and implements singleton pattern,
+    ensuring the configuration is loaded only once.
     """
+    global _config_instance
 
-    if is_false(os.getenv("LMCACHE_USE_EXPERIMENTAL", "True")):
-        logger.warning(
-            "Detected LMCACHE_USE_EXPERIMENTAL is set to False. "
-            "Using legacy configuration is deprecated and will "
-            "be remove soon! Please set LMCACHE_USE_EXPERIMENTAL "
-            "to True."
-        )
-        LMCacheEngineConfig = Config  # type: ignore[assignment]
-    else:
-        LMCacheEngineConfig = V1Config  # type: ignore[assignment]
-
-    if "LMCACHE_CONFIG_FILE" not in os.environ:
-        logger.warn(
-            "No LMCache configuration file is set. Trying to read"
-            " configurations from the environment variables."
-        )
-        logger.warn(
-            "You can set the configuration file through "
-            "the environment variable: LMCACHE_CONFIG_FILE"
-        )
-        config = LMCacheEngineConfig.from_env()
-    else:
-        config_file = os.environ["LMCACHE_CONFIG_FILE"]
-        logger.info(f"Loading LMCache config file {config_file}")
-        config = LMCacheEngineConfig.from_file(config_file)
-        # Update config from environment variables
-        config.update_config_from_env()
-    return config
+    # Double-checked locking for thread-safe singleton
+    if _config_instance is None:
+        with _config_lock:
+            if _config_instance is None:  # Check again within lock
+                if "LMCACHE_CONFIG_FILE" not in os.environ:
+                    logger.warning(
+                        "No LMCache configuration file is set. Trying to read"
+                        " configurations from the environment variables."
+                    )
+                    logger.warning(
+                        "You can set the configuration file through "
+                        "the environment variable: LMCACHE_CONFIG_FILE"
+                    )
+                    _config_instance = LMCacheEngineConfig.from_env()
+                else:
+                    config_file = os.environ["LMCACHE_CONFIG_FILE"]
+                    logger.info(f"Loading LMCache config file {config_file}")
+                    _config_instance = LMCacheEngineConfig.from_file(config_file)
+                    # Update config from environment variables
+                    _config_instance.update_config_from_env()
+    return _config_instance
 
 
 def hex_hash_to_int16(s: str) -> int:
@@ -98,7 +97,11 @@ def mla_enabled(model_config: "ModelConfig") -> bool:
 
 
 def create_lmcache_metadata(
-    vllm_config=None, model_config=None, parallel_config=None, cache_config=None
+    vllm_config=None,
+    model_config=None,
+    parallel_config=None,
+    cache_config=None,
+    role=None,
 ):
     """
     Create LMCacheEngineMetadata from vLLM configuration.
@@ -117,12 +120,17 @@ def create_lmcache_metadata(
         tuple: (LMCacheEngineMetadata, LMCacheEngineConfig)
     """
     # Third Party
-    from vllm.utils import get_kv_cache_torch_dtype
-
+    # Try to import from old location before merged https://github.com/vllm-project/vllm/pull/26908
+    try:
+        # Third Party
+        from vllm.utils.torch_utils import get_kv_cache_torch_dtype
+    except ImportError:
+        # Third Party
+        from vllm.utils import get_kv_cache_torch_dtype
     # First Party
     from lmcache.config import LMCacheEngineMetadata
 
-    config = lmcache_get_config()
+    config = lmcache_get_or_create_config()
     # Support both vllm_config object and individual config parameters
     if vllm_config is not None:
         model_cfg = vllm_config.model_config
@@ -155,6 +163,8 @@ def create_lmcache_metadata(
         kv_dtype,
         kv_shape,
         use_mla,
+        role,
+        served_model_name=model_cfg.served_model_name,
     )
 
     return metadata, config
@@ -190,7 +200,7 @@ def extract_mm_features(
     """
     if getattr(request, "mm_features", None):
         mm_hashes, mm_positions = zip(
-            *((f.identifier, f.mm_position) for f in request.mm_features)
+            *((f.identifier, f.mm_position) for f in request.mm_features), strict=False
         )
         return (list(mm_hashes), list(mm_positions))
     elif getattr(request, "mm_hashes", None):
@@ -200,3 +210,17 @@ def extract_mm_features(
             return (request.mm_hashes, request.mm_positions)
     else:
         return ([], [])
+
+
+def get_size_bytes(shapes: list[torch.Size], kv_dtypes: list[torch.dtype]):
+    """
+    Calculate the size in bytes with the given shapes and dtypes.
+    """
+    assert len(shapes) == len(kv_dtypes), (
+        f"shapes and dtypes must have the same length, "
+        f"but got {len(shapes)} and {len(kv_dtypes)}"
+    )
+    return sum(
+        shape.numel() * kv_dtype.itemsize
+        for shape, kv_dtype in zip(shapes, kv_dtypes, strict=True)
+    )

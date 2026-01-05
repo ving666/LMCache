@@ -15,12 +15,8 @@ Two ways to configure LMCache Redis Offloading:
 
 **1. Environment Variables:**
 
-``LMCACHE_USE_EXPERIMENTAL`` MUST be set by environment variable directly.
-
 .. code-block:: bash
 
-    # Specify LMCache V1
-    export LMCACHE_USE_EXPERIMENTAL=True
     # 256 Tokens per KV Chunk
     export LMCACHE_CHUNK_SIZE=256
     # Redis host
@@ -36,8 +32,6 @@ Two ways to configure LMCache Redis Offloading:
 **2. Configuration File**:
 
 Passed in through ``LMCACHE_CONFIG_FILE=your-lmcache-config.yaml``
-
-``LMCACHE_USE_EXPERIMENTAL`` MUST be set by environment variable directly.
 
 Example ``config.yaml``:
 
@@ -217,7 +211,6 @@ and then comment out the ``LMCACHE_CONFIG_FILE`` below:
     # LMCACHE_REMOTE_URL="redis://localhost:6379" \
     # LMCACHE_REMOTE_SERDE="naive"
     LMCACHE_CONFIG_FILE="redis-offload.yaml" \
-    LMCACHE_USE_EXPERIMENTAL=True \
     vllm serve \
         meta-llama/Llama-3.1-8B-Instruct \
         --max-model-len 16384 \
@@ -243,7 +236,6 @@ and then comment out the ``LMCACHE_CONFIG_FILE`` below:
     # LMCACHE_REMOTE_URL="redis-sentinel://localhost:26379,localhost:26380,localhost:26381" \
     # LMCACHE_REMOTE_SERDE="naive"
     LMCACHE_CONFIG_FILE="redis-sentinel-offload.yaml" \
-    LMCACHE_USE_EXPERIMENTAL=True \
     vllm serve \
         meta-llama/Llama-3.1-8B-Instruct \
         --max-model-len 16384 \
@@ -269,7 +261,6 @@ and then comment out the ``LMCACHE_CONFIG_FILE`` below:
     # LMCACHE_REMOTE_URL="lm://localhost:65432" \
     # LMCACHE_REMOTE_SERDE="naive"
     LMCACHE_CONFIG_FILE="lmcache-server-offload.yaml" \
-    LMCACHE_USE_EXPERIMENTAL=True \
     vllm serve \
         meta-llama/Llama-3.1-8B-Instruct \
         --max-model-len 16384 \
@@ -283,7 +274,7 @@ If you would like to feel the TTFT speed up with offloading and KV Cache reuse, 
 
 Here, we are instead going to demonstrate how to search for and modify LMCache KV Chunk entries in Redis.
 
-Please note that the official LMCache way to achieve this redis-specific functionality of viewing and modifying LMCache KV Chunks is available in :doc:`LMCache Controller <../../kv_cache_management/controller>`.
+Please note that the official LMCache way to achieve this redis-specific functionality of viewing and modifying LMCache KV Chunks is available in :doc:`LMCache Controller <../../kv_cache_management/index>`.
 
 Let's warm/populate LMCache first with ``curl`` this time:
 
@@ -417,7 +408,7 @@ larger than the ``metadata`` entry.
 This tutorial utilized the ``redis-cli`` to directly peak into a remote backend and manipualte
 KV Chunks.
 
-Once again, please refer to the :doc:`LMCache Controller <../../kv_cache_management/controller>`
+Once again, please refer to the :doc:`LMCache Controller <../../kv_cache_management/index>`
 for the official LMCache way of controlling and routing your KV Caches in your LMCache instances.
 
 **Step 4. Clean up:**

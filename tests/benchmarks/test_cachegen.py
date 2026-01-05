@@ -4,9 +4,10 @@ import pytest
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache.config import LMCacheEngineMetadata
 from lmcache.storage_backend.serde.cachegen_decoder import CacheGenDeserializer
 from lmcache.storage_backend.serde.cachegen_encoder import CacheGenSerializer
+from lmcache.v1.config import LMCacheEngineConfig
 
 
 def generate_kv_cache(num_tokens, fmt, device):
@@ -53,6 +54,10 @@ def to_blob(kv_tuples):
 @pytest.mark.benchmark(group="cachegen")
 @pytest.mark.parametrize("fmt", ["vllm", "huggingface"])
 @pytest.mark.parametrize("chunk_size", [64, 256, 768])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to CacheGenSerializer/Deserializer",
+)
 def test_cachegen_decoder_bench(benchmark, fmt, chunk_size):
     config = LMCacheEngineConfig.from_defaults(chunk_size=chunk_size)
     metadata = LMCacheEngineMetadata(

@@ -10,9 +10,11 @@ import time
 
 # Third Party
 import pytest
+import torch
 
 # First Party
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.config import LMCacheEngineMetadata
+from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.memory_management import MixedMemoryAllocator
 
 # This is to mock the constructor and destructor of
@@ -221,6 +223,32 @@ class MockRedisSentinel:
         return self.slave_redis
 
 
+class MockRedisCluster:
+    def __init__(
+        self, startup_nodes=None, max_connections=None, decode_responses=False, **kwargs
+    ):
+        self.startup_nodes = startup_nodes or []
+        self.max_connections = max_connections
+        self.decode_responses = decode_responses
+        self.store = {}
+
+    async def set(self, key, value):
+        self.store[key] = value
+        return True
+
+    async def get(self, key):
+        return self.store.get(key, None)
+
+    async def exists(self, key):
+        return key in self.store
+
+    async def delete(self, key):
+        return self.store.pop(key, None) is not None
+
+    async def close(self):
+        pass
+
+
 @dataclass
 class LMCacheServerProcess:
     server_url: str
@@ -246,6 +274,12 @@ def mock_redis_sentinel():
         patch("redis.Sentinel", MockRedisSentinel) as mock,
         patch("redis.asyncio.Sentinel", MockRedisSentinel),
     ):
+        yield mock
+
+
+@pytest.fixture(scope="function", autouse=True)
+def mock_redis_cluster():
+    with patch("redis.asyncio.cluster.RedisCluster", MockRedisCluster) as mock:
         yield mock
 
 
@@ -400,7 +434,9 @@ def autorelease(request):
 def autorelease_v1(request):
     objects = []
 
-    def _factory(obj):
+    def _factory(obj, **kwargs):
+        if isinstance(obj, LMCacheEngine):
+            obj.post_init(**kwargs)
         objects.append(obj)
         return obj
 
@@ -454,3 +490,18 @@ def use_shared_allocator(request, monkeypatch, memory_allocator):
         _create_shared_allocator,
     )
     yield
+
+
+@pytest.fixture(scope="function")
+def lmcache_engine_metadata(role="worker"):
+    """Create a fresh LMCacheEngineMetadata for each test."""
+    return LMCacheEngineMetadata(
+        model_name="test_model",
+        world_size=1,
+        worker_id=0,
+        fmt="vllm",
+        kv_dtype=torch.bfloat16,
+        kv_shape=(32, 2, 256, 32, 128),
+        use_mla=False,
+        role=role,
+    )

@@ -1,85 +1,61 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+LMCache Engine Configuration
+
+Configuration system for LMCache Engine that:
+- Loads configuration from YAML file or environment variables
+- Supports command-line parameter overrides
+- Provides convenient access to configuration values
+"""
+
 # Standard
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional
 import json
 import os
-import re
-
-# Third Party
-import yaml
 
 # First Party
 from lmcache.logging import init_logger
-import lmcache.config as orig_config
+from lmcache.v1.config_base import (
+    _parse_local_disk,
+    _parse_quoted_string,
+    _resolve_config_aliases,
+    _to_bool,
+    _to_float_list,
+    _to_int_list,
+    _to_str_list,
+    create_config_class,
+    load_config_with_overrides,
+)
 
 logger = init_logger(__name__)
-
-
-def _parse_local_disk(local_disk) -> Optional[str]:
-    match local_disk:
-        case None:
-            local_disk_path = None
-        case path if re.match(r"file://(.*)/", path):
-            local_disk_path = path[7:]
-        case _:
-            local_disk_path = local_disk
-    return local_disk_path
-
-
-def _to_int_list(
-    value: Optional[Union[str, int, list[Any]]],
-) -> Optional[list[int]]:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return [int(x) for x in value]
-    if isinstance(value, int):
-        return [value]
-    parts = [p.strip() for p in str(value).split(",") if p.strip()]
-    return [int(p) for p in parts]
-
-
-def _to_float_list(
-    value: Optional[Union[str, float, list[Any]]],
-) -> Optional[list[float]]:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return [float(x) for x in value]
-    if isinstance(value, float):
-        return [value]
-    parts = [p.strip() for p in str(value).split(",") if p.strip()]
-    return [float(p) for p in parts]
-
-
-def _to_str_list(
-    value: Optional[Union[str, list[str]]],
-) -> Optional[list[str]]:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return value
-    parts = [p.strip() for p in value.split(",") if p.strip()]
-    return [p for p in parts]
-
-
-def _to_bool(
-    value: Optional[Union[bool, int, str]],
-) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ["true", "1"]
 
 
 # Configuration aliases and deprecated mappings
 _CONFIG_ALIASES = {
     # Maps deprecated names to current names
-    "nixl_peer_port": "nixl_receiver_port",
+    "enable_xpyd": "enable_pd",
+    "nixl_peer_host": "pd_peer_host",
+    "nixl_peer_init_port": "pd_peer_init_port",
+    "nixl_peer_alloc_port": "pd_peer_alloc_port",
+    "nixl_proxy_host": "pd_proxy_host",
+    "nixl_proxy_port": "pd_proxy_port",
+    "nixl_buffer_size": "pd_buffer_size",
+    "nixl_role": "pd_role",
+    "controller_url": "controller_pull_url",
+    "lmcache_worker_port": "lmcache_worker_ports",
+    "plugin_locations": "runtime_plugin_locations",
+    "external_backends": "storage_plugins",
 }
 
 _DEPRECATED_CONFIGS = {
     # Maps deprecated names to warning messages
     "nixl_peer_port": "nixl_peer_port is deprecated, use nixl_receiver_port instead",
+    "plugin_locations": (
+        "plugin_locations is deprecated, use runtime_plugin_locations instead"
+    ),
+    "external_backends": (
+        "external_backends is deprecated, use storage_plugins instead"
+    ),
 }
 
 # Single configuration definition center - add new config items only here
@@ -92,6 +68,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_bool,
     },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
+    "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
         "type": Optional[str],
         "default": None,
@@ -149,8 +126,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "lookup_url": {"type": Optional[str], "default": None, "env_converter": str},
-    "distributed_url": {"type": Optional[str], "default": None, "env_converter": str},
+    "p2p_host": {"type": Optional[str], "default": None, "env_converter": str},
+    "p2p_init_ports": {
+        "type": Optional[list[int]],
+        "default": None,
+        "env_converter": _to_int_list,
+    },
+    "p2p_lookup_ports": {
+        "type": Optional[list[int]],
+        "default": None,
+        "env_converter": _to_int_list,
+    },
     # Controller configurations
     "enable_controller": {
         "type": bool,
@@ -158,15 +144,29 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_bool,
     },
     "lmcache_instance_id": {
-        "type": str,
-        "default": "lmcache_default_instance",
+        "type": Optional[str],
+        "default": None,
         "env_converter": str,
     },
-    "controller_url": {"type": Optional[str], "default": None, "env_converter": str},
-    "lmcache_worker_port": {
-        "type": Optional[int],
+    "controller_pull_url": {
+        "type": Optional[str],
         "default": None,
-        "env_converter": int,
+        "env_converter": str,
+    },
+    "controller_reply_url": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "lmcache_worker_ports": {
+        "type": Optional[list[int]],
+        "default": None,
+        "env_converter": _to_int_list,
+    },
+    "lmcache_worker_ids": {
+        "type": Optional[list[int]],
+        "default": None,
+        "env_converter": _to_int_list,
     },
     # LMCache Worker heartbeat
     # the lmcache_worker_heartbeat_delay_time means that delay a period of time
@@ -183,60 +183,51 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": int,
     },
-    # Nixl configurations
-    "enable_nixl": {
+    # PD-related configurations
+    "enable_pd": {
         "type": bool,
         "default": False,
         "env_converter": _to_bool,
     },
-    "nixl_role": {"type": Optional[str], "default": None, "env_converter": str},
-    "nixl_receiver_host": {
+    "pd_role": {"type": Optional[str], "default": None, "env_converter": str},
+    "pd_buffer_size": {"type": Optional[int], "default": None, "env_converter": int},
+    "pd_buffer_device": {
         "type": Optional[str],
         "default": None,
         "env_converter": str,
     },
-    "nixl_receiver_port": {
-        "type": Optional[int],
+    "pd_peer_host": {"type": Optional[str], "default": None, "env_converter": str},
+    "pd_peer_init_port": {
+        "type": Optional[list[int]],
         "default": None,
-        "env_converter": int,
+        "env_converter": _to_int_list,
     },
-    "nixl_buffer_size": {"type": Optional[int], "default": None, "env_converter": int},
-    "nixl_buffer_device": {
-        "type": Optional[str],
+    "pd_peer_alloc_port": {
+        "type": Optional[list[int]],
         "default": None,
-        "env_converter": str,
+        "env_converter": _to_int_list,
     },
-    "nixl_enable_gc": {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
-    },
+    "pd_proxy_host": {"type": Optional[str], "default": None, "env_converter": str},
+    "pd_proxy_port": {"type": Optional[int], "default": None, "env_converter": int},
+    # Transfer-related configurations
+    "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
+    # Nixl-related configurations
     "nixl_backends": {
         "type": Optional[list[str]],
         "default": None,
         "env_converter": _to_str_list,
     },
-    # Experimental Nixl configurations
-    "enable_xpyd": {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
-    },
-    "nixl_peer_host": {"type": Optional[str], "default": None, "env_converter": str},
-    "nixl_peer_init_port": {
-        "type": Optional[list[int]],
+    "nixl_buffer_size": {
+        "type": Optional[int],
         "default": None,
-        "env_converter": _to_int_list,
+        "env_converter": int,
     },
-    "nixl_peer_alloc_port": {
-        "type": Optional[list[int]],
+    "nixl_buffer_device": {
+        "type": Optional[str],
         "default": None,
-        "env_converter": _to_int_list,
+        "env_converter": str,
     },
-    "nixl_proxy_host": {"type": Optional[str], "default": None, "env_converter": str},
-    "nixl_proxy_port": {"type": Optional[int], "default": None, "env_converter": int},
     # Storage paths
-    "weka_path": {"type": Optional[str], "default": None, "env_converter": str},
     "gds_path": {"type": Optional[str], "default": None, "env_converter": str},
     "cufile_buffer_size": {
         "type": Optional[int],
@@ -267,7 +258,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "save_unfull_chunk": {
         "type": bool,
-        "default": True,
+        "default": False,
         "env_converter": _to_bool,
     },
     "blocking_timeout_secs": {"type": int, "default": 10, "env_converter": int},
@@ -321,111 +312,203 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": str,
     },
-    "plugin_locations": {
+    "runtime_plugin_locations": {
         "type": Optional[list[str]],
         "default": None,
         "env_converter": lambda x: x if isinstance(x, list) else [x] if x else [],
     },
-    "external_backends": {
+    "storage_plugins": {
         "type": Optional[list[str]],
         "default": None,
         "env_converter": _to_str_list,
     },
+    # Lookup client configurations
+    "lookup_timeout_ms": {
+        "type": int,
+        "default": 3000,
+        "env_converter": int,
+    },
+    "hit_miss_ratio": {
+        "type": Optional[float],
+        "default": None,
+        "env_converter": float,
+    },
+    "lookup_server_worker_ids": {
+        "type": Optional[list[int]],
+        "default": None,
+        "env_converter": _to_int_list,
+    },
+    "enable_scheduler_bypass_lookup": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "script_allowed_imports": {
+        "type": Optional[list[str]],
+        "default": None,
+        "env_converter": _to_str_list,
+    },
+    # Lazy memory allocator configurations
+    "enable_lazy_memory_allocator": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Enable lazy memory allocator to reduce initial memory footprint. "
+            "Memory is allocated on-demand and expanded automatically when needed."
+        ),
+    },
+    "lazy_memory_initial_ratio": {
+        "type": float,
+        "default": 0.2,
+        "env_converter": float,
+        "description": (
+            "Initial memory allocation ratio (0.0-1.0). "
+            "Determines the percentage of target memory size to allocate at startup. "
+            "Default is 0.2 (20%)."
+        ),
+    },
+    "lazy_memory_expand_trigger_ratio": {
+        "type": float,
+        "default": 0.5,
+        "env_converter": float,
+        "description": (
+            "Memory usage ratio (0.0-1.0) that triggers automatic expansion. "
+            "When memory usage exceeds this threshold, expansion is triggered. "
+            "Default is 0.5 (50%)."
+        ),
+    },
+    "lazy_memory_step_ratio": {
+        "type": float,
+        "default": 0.1,
+        "env_converter": float,
+        "description": (
+            "Memory expansion step ratio (0.0-1.0). "
+            "Determines the percentage of target memory size to add in each expansion. "
+            "Default is 0.1 (10%)."
+        ),
+    },
+    "lazy_memory_safe_size": {
+        "type": float,
+        "default": 0.0,
+        "env_converter": float,
+        "description": (
+            "Safe threshold size in GB. Lazy allocator is only enabled when "
+            "max_local_cpu_size exceeds this value. Default is 0.0 GB (always enabled)."
+        ),
+    },
+    # Chunk statistics configurations
+    "enable_chunk_statistics": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Enable chunk statistics tracking.",
+    },
+    "chunk_statistics_auto_start_statistics": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Auto-start statistics on init.",
+    },
+    "chunk_statistics_auto_exit_timeout_hours": {
+        "type": float,
+        "default": 0.0,
+        "env_converter": float,
+        "description": "Auto-stop timeout in hours (0=disabled).",
+    },
+    "chunk_statistics_auto_exit_target_unique_chunks": {
+        "type": int,
+        "default": 0,
+        "env_converter": int,
+        "description": "Auto-stop at target unique chunks.",
+    },
+    "chunk_statistics_strategy": {
+        "type": str,
+        "default": "memory_bloom_filter",
+        "env_converter": str,
+        "description": "Recording strategy: memory_bloom_filter or file_hash.",
+    },
+    # KV events configuration
+    "enable_kv_events": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    # TODO(chunxiaozheng): remove this after VLLMPagedMemGPUConnectorV3 is stable
+    "use_gpu_connector_v3": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
 }
 
 
-def _resolve_config_aliases(config_dict: dict, source: str) -> dict:
-    """Resolve configuration aliases and handle deprecated configurations."""
-    resolved = {}
-
-    # Process each key in the input
-    for key, value in config_dict.items():
-        if key in _DEPRECATED_CONFIGS:
-            # Log deprecation warning
-            logger.warning(f"{_DEPRECATED_CONFIGS[key]} (source: {source})")
-
-            # Map to new key if alias exists
-            if key in _CONFIG_ALIASES:
-                new_key = _CONFIG_ALIASES[key]
-                resolved[new_key] = value
-            else:
-                # Keep deprecated key for backward compatibility
-                resolved[key] = value
-        elif key in _CONFIG_DEFINITIONS:
-            # Valid configuration key
-            resolved[key] = value
-        else:
-            # Unknown configuration key
-            logger.warning(f"Unknown configuration key: {key} (source: {source})")
-
-    return resolved
-
-
-# Dynamically create configuration class
-def _create_config_class():
-    """Dynamically create configuration class"""
-    # Extract fields from configuration definitions
-    fields_dict = {}
-    for name, config in _CONFIG_DEFINITIONS.items():
-        fields_dict[name] = (config["type"], config["default"])
-
-    # Create class using make_dataclass
-    # Standard
-    from dataclasses import make_dataclass
-
-    def _post_init(self):
-        self.validate()
-
-    cls = make_dataclass(
-        "LMCacheEngineConfig",
-        [(name, type_, default) for name, (type_, default) in fields_dict.items()],
-        namespace={
-            "__post_init__": _post_init,
-            "validate": _validate_config,
-            "log_config": _log_config,
-            "to_original_config": _to_original_config,
-            "get_extra_config_value": _get_extra_config_value,
-            "from_defaults": classmethod(_from_defaults),
-            "from_legacy": classmethod(_from_legacy),
-            "from_file": classmethod(_from_file),
-            "from_env": classmethod(_from_env),
-            "update_config_from_env": _update_config_from_env,
-            "__str__": lambda self: str(
-                {name: getattr(self, name) for name in _CONFIG_DEFINITIONS}
-            ),
-            "from_dict": classmethod(_from_dict),
-            "to_dict": _to_dict,
-            "to_json": _to_json,
-            "from_json": classmethod(_from_json),
-        },
-    )
-    return cls
-
-
+# Specialized methods that are unique to LMCacheEngineConfig
 def _validate_config(self):
     """Validate configuration"""
+
+    # needed for the old async serializer implementation
+    # # auto-adjust save_unfull_chunk for async loading to prevent CPU fragmentation
+    # if self.enable_async_loading:
+    #     logger.warning(
+    #         "Automatically setting save_unfull_chunk=False because "
+    #         "enable_async_loading=True or use_layerwise=True to prevent "
+    #         "CPU memory fragmentation"
+    #     )
+    #     self.save_unfull_chunk = False
+
+    if self.enable_blending:
+        if not self.save_unfull_chunk:
+            logger.warning(
+                "Automatically setting save_unfull_chunk=True because "
+                "enable_blending=True"
+            )
+            self.save_unfull_chunk = True
+
     if self.enable_p2p:
-        assert self.lookup_url is not None
-        assert self.distributed_url is not None
+        assert self.enable_controller
+        assert self.controller_pull_url is not None
+        assert self.controller_reply_url is not None
+        assert self.lmcache_worker_ports is not None
+        assert self.p2p_host is not None
+        assert self.p2p_init_ports is not None
+        assert self.p2p_lookup_ports is not None
+        assert self.transfer_channel is not None
 
     enable_nixl_storage = self.extra_config is not None and self.extra_config.get(
         "enable_nixl_storage"
     )
-    if self.enable_nixl:
-        assert self.nixl_role is not None
-        assert self.nixl_buffer_size is not None
-        assert self.nixl_buffer_device is not None
+    if self.enable_pd:
+        assert self.pd_role is not None
+        assert self.pd_buffer_size is not None
+        assert self.pd_buffer_device is not None
 
-        assert self.remote_url is None, "Nixl only supports remote_url=None"
+        assert self.remote_url is None, "PD only supports remote_url=None"
         assert self.save_decode_cache is False, (
-            "Nixl only supports save_decode_cache=False"
+            "PD only supports save_decode_cache=False"
         )
-        assert self.enable_p2p is False, "Nixl only supports enable_p2p=False"
+        assert self.enable_p2p is False, "PD only supports enable_p2p=False"
+
+        # PD requires save_unfull_chunk=True for complete KV cache transfer
+        # from prefill node to decode node. Without this, partial chunks would
+        # be discarded, causing incomplete KV cache transfer and wrong results
+        # on the decode node.
+        if not self.save_unfull_chunk:
+            logger.warning(
+                "PD (Peer-to-Peer Disaggregation) requires save_unfull_chunk=True "
+                "for complete KV cache transfer. Automatically setting "
+                "save_unfull_chunk=True."
+            )
+            self.save_unfull_chunk = True
+        else:
+            logger.info(
+                "PD mode enabled with save_unfull_chunk=True - all KV cache "
+                "including partial chunks will be transferred to decode node"
+            )
 
     if enable_nixl_storage:
         assert self.extra_config.get("nixl_backend") is not None
-        assert self.extra_config.get("nixl_path") is not None
-        assert self.extra_config.get("nixl_file_pool_size") is not None
+        assert self.extra_config.get("nixl_pool_size") is not None
         assert self.nixl_buffer_size is not None
         assert self.nixl_buffer_device is not None
 
@@ -445,24 +528,6 @@ def _log_config(self):
     return self
 
 
-def _to_original_config(self):
-    """Convert to original configuration format"""
-    return orig_config.LMCacheEngineConfig(
-        chunk_size=self.chunk_size,
-        local_device="cpu" if self.local_cpu else "cuda",
-        max_local_cache_size=int(self.max_local_cpu_size),
-        remote_url=None,
-        remote_serde=None,
-        pipelined_backend=False,
-        save_decode_cache=self.save_decode_cache,
-        enable_blending=self.enable_blending,
-        blend_recompute_ratio=0.15,
-        blend_min_tokens=self.blend_min_tokens,
-        blend_separator="[BLEND_SEP]",
-        blend_add_special_in_precomp=False,
-    )
-
-
 def _get_extra_config_value(self, key, default_value=None):
     if hasattr(self, "extra_config") and self.extra_config is not None:
         return self.extra_config.get(key, default_value)
@@ -470,14 +535,32 @@ def _get_extra_config_value(self, key, default_value=None):
         return default_value
 
 
-def _from_defaults(cls, **kwargs):
-    """Create configuration from defaults"""
-    config_values = {}
-    for name, config in _CONFIG_DEFINITIONS.items():
-        config_values[name] = kwargs.get(name, config["default"])
+def _get_lmcache_worker_ids(self, use_mla, world_size):
+    if not self.lmcache_worker_ids:
+        # if mla is not enabled, return all worker ids, which means start
+        # lmcache worker on all ranks as default;
+        # if mla is enabled, return [0], which means start lmcache
+        # worker on worker 0 as default.
+        return [0] if use_mla else list(range(world_size))
 
-    instance = cls(**config_values)
-    return instance.log_config()
+    # check the input
+    for worker_id in self.lmcache_worker_ids:
+        assert -1 < worker_id < world_size
+    return self.lmcache_worker_ids
+
+
+def _get_lookup_server_worker_ids(self, use_mla, world_size):
+    if not self.lookup_server_worker_ids:
+        # if mla is not enabled, return all worker ids, which means start
+        # lookup server on all worker as default;
+        # if mla is enabled, return [0], which means start lookup
+        # server on worker 0 as default.
+        return [0] if use_mla else list(range(world_size))
+
+    # check the input
+    for worker_id in self.lookup_server_worker_ids:
+        assert -1 < worker_id < world_size
+    return self.lookup_server_worker_ids
 
 
 def _from_legacy(cls, **kwargs):
@@ -541,36 +624,8 @@ def _from_legacy(cls, **kwargs):
             config_values[name] = config["default"]
 
     instance = cls(**config_values)
-    return instance.log_config()
-
-
-def _from_file(cls, file_path: str):
-    """Load configuration from file"""
-    with open(file_path, "r") as fin:
-        file_config = yaml.safe_load(fin) or {}
-
-    # Resolve aliases and handle deprecated configurations
-    resolved_config = _resolve_config_aliases(file_config, f"file: {file_path}")
-
-    config_values = {}
-    for name, config in _CONFIG_DEFINITIONS.items():
-        value = resolved_config.get(name, config["default"])
-        if value is not None:
-            value = config["env_converter"](value)
-
-        # Handle local_disk parsing
-        if name == "local_disk":
-            value = _parse_local_disk(value)
-
-        # Validate remote_url format
-        if name == "remote_url" and value is not None:
-            if not re.match(r"(.*)://(.*)", value):
-                raise ValueError(f"Invalid remote storage url: {value}")
-
-        config_values[name] = value
-
-    instance = cls(**config_values)
-    return instance.log_config()
+    instance.validate()
+    return instance
 
 
 def _update_config_from_env(self):
@@ -601,55 +656,74 @@ def _update_config_from_env(self):
     for name, config in _CONFIG_DEFINITIONS.items():
         if name in resolved_config:
             try:
-                value = resolved_config[name]
+                # Parse quoted strings and handle escape characters
+                raw_value = resolved_config[name]  # Keep original value for logging
+                value = _parse_quoted_string(raw_value)
                 converted_value = config["env_converter"](value)
                 setattr(self, name, converted_value)
             except (ValueError, json.JSONDecodeError) as e:
-                logger.warning(f"Failed to parse {get_env_name(name)}: {e}")
+                logger.warning(
+                    f"Failed to parse {get_env_name(name)}={raw_value!r}: {e}"
+                )
                 # Keep existing value if conversion fails
-
+    self.validate()
     return self
 
 
-def _from_env(cls):
-    """Load configuration from environment variables"""
-    instance = cls.from_defaults()
-    _update_config_from_env(instance)
-    return instance.log_config()
+def _validate_and_set_config_value(config, config_key, value):
+    """Validate and set configuration value"""
+    if not hasattr(config, config_key):
+        logger.warning(f"Config key '{config_key}' does not exist in configuration")
+        return False
 
-
-def _from_dict(cls, config_dict: dict):
-    """Create configuration from a dictionary."""
-    resolved_config = _resolve_config_aliases(config_dict, "dictionary input")
-    config_values = {}
-    for name, config in _CONFIG_DEFINITIONS.items():
-        value = resolved_config.get(name, config["default"])
-        if value is not None:
-            value = config["env_converter"](value)
-        config_values[name] = value
-    instance = cls(**config_values)
-    return instance.log_config()
-
-
-def _to_dict(self):
-    """Convert the configuration object into a dictionary."""
-    return {name: getattr(self, name) for name in _CONFIG_DEFINITIONS}
-
-
-def _from_json(cls, json_str: str):
-    """Deserialize a JSON string into a configuration object."""
     try:
-        config_dict = json.loads(json_str)
-        return cls.from_dict(config_dict)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON input: {e}")
-        raise
+        setattr(config, config_key, value)
+        return True
+    except Exception as e:
+        logger.error(
+            f"Failed to set config item '{config_key}' with value {value}: {e}"
+        )
+        return False
 
 
-def _to_json(self):
-    """Serialize the configuration object to a JSON string."""
-    return json.dumps(self.to_dict(), indent=2)
+# Create configuration class using the base utility
+LMCacheEngineConfig = create_config_class(
+    config_name="LMCacheEngineConfig",
+    config_definitions=_CONFIG_DEFINITIONS,
+    config_aliases=_CONFIG_ALIASES,
+    deprecated_configs=_DEPRECATED_CONFIGS,
+    namespace_extras={
+        "validate": _validate_config,
+        "log_config": _log_config,
+        "get_extra_config_value": _get_extra_config_value,
+        "get_lmcache_worker_ids": _get_lmcache_worker_ids,
+        "get_lookup_server_worker_ids": _get_lookup_server_worker_ids,
+        "from_legacy": classmethod(_from_legacy),
+    },
+)
 
 
-# Create configuration class
-LMCacheEngineConfig = _create_config_class()
+def load_engine_config_with_overrides(
+    config_file_path: Optional[str] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> "LMCacheEngineConfig":  # type: ignore[valid-type]
+    """
+    Load engine configuration with support for file, env vars, and overrides.
+
+    This function uses the generic load_config_with_overrides utility from
+    config_base.py to reduce code duplication.
+
+    Args:
+        config_file_path: Optional direct path to config file
+        overrides: Optional dictionary of configuration overrides
+
+    Returns:
+        Loaded and validated LMCacheEngineConfig instance
+    """
+
+    return load_config_with_overrides(
+        config_class=LMCacheEngineConfig,
+        config_file_env_var="LMCACHE_CONFIG_FILE",
+        config_file_path=config_file_path,
+        overrides=overrides,
+    )

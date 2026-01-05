@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import TYPE_CHECKING, Literal, Optional
+import os
 import socket
 
 # Third Party
@@ -18,9 +19,16 @@ logger = init_logger(__name__)
 
 ServiceKind = Literal["lookup", "offload", "lookup_worker", "lookup_scheduler"]
 
+# Default timeout constants for socket operations (in milliseconds)
+DEFAULT_SOCKET_RECV_TIMEOUT_MS = 30000
+DEFAULT_SOCKET_SEND_TIMEOUT_MS = 10000
 
-def get_zmq_context():
-    return zmq.asyncio.Context.instance()
+
+def get_zmq_context(use_asyncio: bool = True):
+    if use_asyncio:
+        return zmq.asyncio.Context.instance()
+    else:
+        return zmq.Context.instance()
 
 
 def get_zmq_socket(
@@ -38,6 +46,32 @@ def get_zmq_socket(
     else:
         raise ValueError(f"Invalid bind_or_connect: {bind_or_connect}")
 
+    return socket
+
+
+def get_zmq_socket_with_timeout(
+    context,
+    socket_path: str,
+    protocol: str,
+    role,
+    bind_or_connect: str,
+    recv_timeout_ms: int,
+    send_timeout_ms: int,
+) -> zmq.asyncio.Socket:
+    """
+    Create a ZeroMQ socket with timeout settings.
+    """
+    socket = get_zmq_socket(
+        context,
+        socket_path,
+        protocol,
+        role,
+        bind_or_connect,
+    )
+    # Only set RCVTIMEO for client role connect sockets
+    if bind_or_connect == "connect":
+        socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
+    socket.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
     return socket
 
 
@@ -78,11 +112,21 @@ def get_zmq_rpc_path_lmcache(
     vllm_config: Optional["VllmConfig"] = None,
     service_name: ServiceKind = "lookup",
     rpc_port: int = 0,
-    tp_rank: int = 0,
+    rank: int = 0,
 ) -> str:
     """Get the ZMQ RPC path for LMCache lookup and offload communication."""
-    # Third Party
-    import vllm.envs as envs
+    # Try to import vllm.envs, fallback to default if not available
+    try:
+        # Third Party
+        import vllm.envs as envs
+
+        base_url = envs.VLLM_RPC_BASE_PATH
+    except (ImportError, ModuleNotFoundError):
+        # Fallback for testing environments without vllm
+        base_url = "/tmp/vllm_rpc"
+        logger.debug("vllm not available, using default base_url: %s", base_url)
+        # Ensure the directory exists for IPC socket
+        os.makedirs(base_url, exist_ok=True)
 
     if vllm_config is None or vllm_config.kv_transfer_config is None:
         raise ValueError("A valid kv_transfer_config with engine_id is required.")
@@ -92,14 +136,12 @@ def get_zmq_rpc_path_lmcache(
             f"service_name must be 'lookup' or 'offload', got {service_name!r}"
         )
 
-    base_url = envs.VLLM_RPC_BASE_PATH
-
     engine_id = vllm_config.kv_transfer_config.engine_id
 
     if isinstance(rpc_port, str):
-        rpc_port = rpc_port + str(tp_rank)
+        rpc_port = rpc_port + str(rank)
     else:
-        rpc_port += tp_rank
+        rpc_port += rank
 
     logger.debug(
         "Base URL: %s, Engine: %s, Service Name: %s, RPC Port: %s",
@@ -110,7 +152,7 @@ def get_zmq_rpc_path_lmcache(
     )
 
     socket_path = (
-        f"ipc://{base_url}/engine_{engine_id}_service_{service_name}_"
+        f"{base_url}/engine_{engine_id}_service_{service_name}_"
         f"lmcache_rpc_port_{rpc_port}"
     )
 
